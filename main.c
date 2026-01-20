@@ -1,86 +1,102 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <unistd.h>   // Para fork, execvp, chdir
-#include <sys/wait.h> // Para wait
-#include <stdlib.h>   // Para exit
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 int main() {
     char buffer[1024];
-    char *token;
     char *args[64];
+    char *token;
 
     while (1) {
-        int contador = 0;
         printf("santi-shell> ");
+        
+        // --- 1. LEER ---
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL) break;
+        
+        // Limpiar salto de linea
+        size_t len = strlen(buffer);
+        if (len > 0 && buffer[len - 1] == '\n') buffer[len - 1] = '\0';
+        if (strcmp(buffer, "salir") == 0) break;
 
-        // 1. LEER LA ENTRADA
-        if (fgets(buffer, sizeof(buffer), stdin) != NULL) {
-            size_t len = strlen(buffer);
-            // Eliminar el salto de línea del final
-            if (len > 0 && buffer[len - 1] == '\n') {
-                buffer[len - 1] = '\0';
-            }
-
-            // Salida limpia
-            if (strcmp(buffer, "salir") == 0) {
-                printf("Saliendo del programa.\n");
-                break;
-            }
-        } else {
-            printf("\nError de lectura o fin de entrada.\n");
-            break;
-        }
-
-        // 2. PARSEAR (TROCEAR)
+        // --- 2. PARSEAR ---
+        int i = 0;
         token = strtok(buffer, " ");
         while (token != NULL) {
-            args[contador] = token;
-            contador++;
+            args[i++] = token;
             token = strtok(NULL, " ");
         }
-        args[contador] = NULL; // Importante: terminar con NULL
+        args[i] = NULL;
+        if (args[0] == NULL) continue;
 
-        // Si el usuario dio Enter sin escribir nada, volvemos a empezar
-        if (args[0] == NULL) {
-            continue;
+        // --- NIVEL 2: COMANDO CD (Interno) ---
+        if (strcmp(args[0], "cd") == 0) {
+            if (args[1] == NULL) fprintf(stderr, "Error: falta argumento\n");
+            else if (chdir(args[1]) != 0) perror("Error en cd");
+            continue; // Saltamos al siguiente ciclo
         }
 
-        // Usamos strcmp, no ==. Si devuelve 0, son iguales.
-        if (strcmp(args[0], "cd") == 0) {
-            // Verificamos si hay un argumento (la ruta)
-            if (args[1] == NULL) {
-                fprintf(stderr, "Error: argumento requerido para \"cd\"\n");
-            } else {
-                // Intentamos cambiar de directorio
-                if (chdir(args[1]) != 0) {
-                    // Si falla (carpeta no existe, permisos...), imprime el error
-                    perror("santi-shell: cd");
+        // --- NIVEL 4: PIPES / TUBERÍAS (|) ---
+        // Buscamos si hay un "|"
+        int pipe_pos = -1;
+        for (int j = 0; args[j] != NULL; j++) {
+            if (strcmp(args[j], "|") == 0) {
+                pipe_pos = j;
+                break;
+            }
+        }
+
+        if (pipe_pos != -1) {
+            // Hay un Pipe. Dividimos en dos comandos: Izq | Der
+            args[pipe_pos] = NULL;       // Cortamos el comando Izquierdo
+            char **args2 = &args[pipe_pos + 1]; // El comando Derecho empieza después del |
+
+            int fd[2]; 
+            pipe(fd); // Creamos la tubería (fd[0] lectura, fd[1] escritura)
+
+            // Hijo 1 (Comando Izquierda) -> Escribe en el Pipe
+            if (fork() == 0) {
+                dup2(fd[1], STDOUT_FILENO); // Salida -> Entrada del Pipe
+                close(fd[0]); close(fd[1]); // Cerramos lo que no usamos
+                execvp(args[0], args);
+                perror("Error exec izq"); exit(1);
+            }
+
+            // Hijo 2 (Comando Derecha) -> Lee del Pipe
+            if (fork() == 0) {
+                dup2(fd[0], STDIN_FILENO); // Entrada -> Salida del Pipe
+                close(fd[0]); close(fd[1]);
+                execvp(args2[0], args2);
+                perror("Error exec der"); exit(1);
+            }
+
+            // Padre: Cierra tubos y espera a los dos hijos
+            close(fd[0]); close(fd[1]);
+            wait(NULL); wait(NULL);
+            
+            continue; // Terminamos esta vuelta, no seguimos abajo
+        }
+
+        // --- NIVEL 1 y 3: EJECUCIÓN NORMAL Y REDIRECCIÓN (>) ---
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Buscamos Redirección '>'
+            for (int j = 0; args[j] != NULL; j++) {
+                if (strcmp(args[j], ">") == 0) {
+                    char *filename = args[j+1];
+                    int file = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    dup2(file, STDOUT_FILENO); // Salida -> Archivo
+                    close(file);
+                    args[j] = NULL; // Cortamos el comando antes del '>'
+                    break;
                 }
             }
-            // CRÍTICO: Saltamos el resto del bucle (fork/exec) y volvemos al prompt
-            continue;
-        }
-
-
-        pid_t pid = fork();
-
-        if (pid == -1) {
-            // Error fatal al intentar clonar
-            perror("Error en fork");
-            exit(1);
-        }
-
-        if (pid == 0) {
-            // --- PROCESO HIJO ---
-            // Intenta mutar en el comando
             execvp(args[0], args);
-            
-            // Si llega aquí, execvp falló (comando no existe)
-            perror("Error en exec");
-            exit(1); // Matamos al hijo para que no siga ejecutando código del shell
+            perror("Error comando no encontrado");
+            exit(1);
         } else {
-            // --- PROCESO PADRE ---
-            // Espera a que el hijo termine
             wait(NULL);
         }
     }
